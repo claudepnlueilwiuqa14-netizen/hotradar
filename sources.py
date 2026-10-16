@@ -13,7 +13,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
 TIMEOUT = 20
-PROXY = ""          # 设 "http://127.0.0.1:7897" 走代理
+PROXY = "http://127.0.0.1:7897"   # 沙箱直连被透明代理拦，必须走 Clash
 
 LAST_ERRORS = {}
 
@@ -272,15 +272,21 @@ def douyin():
         try:
             d = json.loads(_get("https://www.douyin.com/aweme/v1/web/hot/search/list/?device_platform=webapp&aid=6383",
                                 {"Referer": "https://www.douyin.com/hot"}))
-            lst = (d.get("data") or {}).get("word_list") or []
+            data = d.get("data") or {}
+            # 双榜: word_list 热搜主榜 + trending_list 实时上升
             out = []
-            for i, v in enumerate(lst):
+            for i, v in enumerate(data.get("word_list") or []):
                 out.append({"platform": n, "rank": i + 1, "title": v.get("word"),
+                            "url": "https://www.douyin.com/hot/" + str(v.get("sentence_id") or ""),
+                            "hot": _num(v.get("hot_value")), "tag": v.get("label") or None})
+            base = len(out)
+            for j, v in enumerate(data.get("trending_list") or []):
+                out.append({"platform": n + "-上升", "rank": base + j + 1, "title": v.get("word"),
                             "url": "https://www.douyin.com/hot/" + str(v.get("sentence_id") or ""),
                             "hot": _num(v.get("hot_value")), "tag": v.get("label") or None})
             if out:
                 _ok(n); return out
-            last = "status_code=%s" % d.get("status_code")
+            last = "status_code=%s keys=%s" % (d.get("status_code"), list(data.keys()))
             time.sleep(2.0 * (attempt + 1))
         except Exception as e:
             last = str(e)[:80]
