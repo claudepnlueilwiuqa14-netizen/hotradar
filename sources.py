@@ -17,13 +17,25 @@ PROXY = "http://127.0.0.1:7897"   # 沙箱直连被透明代理拦，必须走 C
 
 LAST_ERRORS = {}
 
+# CDP 复用工具（2026-10-17 新增）：优先复用 Chrome 9222 里已停靠的标签页
+try:
+    from cdpkit import cdp_reuse, cdp_open, JS_LINKS
+except Exception:      # 单独跑 sources.py 时目录已在 sys.path；失败就降级
+    def cdp_reuse(*a, **k):
+        return None
 
-def _get(url, headers=None, timeout=TIMEOUT, decode=True):
+    def cdp_open(*a, **k):
+        return None
+
+    JS_LINKS = "() => []"
+
+
+def _open(url, headers=None, timeout=TIMEOUT, proxy=None):
     h = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "gzip, deflate"}
     if headers:
         h.update(headers)
-    if PROXY:
-        op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
+    if proxy:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     else:
         op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     rq = urllib.request.Request(url, headers=h)
@@ -34,7 +46,24 @@ def _get(url, headers=None, timeout=TIMEOUT, decode=True):
             raw = gzip.decompress(raw)
         except Exception:
             pass
-    return raw.decode("utf-8", "ignore") if decode else raw
+    return raw.decode("utf-8", "ignore")
+
+
+def _get(url, headers=None, timeout=TIMEOUT, decode=True):
+    """代理优先，失败自动换直连，两条路各重试。
+
+    2026-10-17 实测：国内站走 Clash 代理会 SSL EOF / 403，直连反而通；
+    国际站（github/hackernews）必须走代理。所以两条路都要试，谁通用谁。
+    """
+    last = None
+    for px in (PROXY, None):
+        for attempt in range(2):
+            try:
+                return _open(url, headers, timeout, px)
+            except Exception as e:
+                last = e
+                time.sleep(0.6 * (attempt + 1))
+    raise last
 
 
 def _num(v):
@@ -137,23 +166,25 @@ def weibo():
             _ok(n); return out
     except Exception as e:
         _err(n, e)
-    # 最后兜底：本机已登录 Chrome（CDP 9222）
-    html = cdp_fetch("https://s.weibo.cn/top/summary?cate=realtimehot", wait_ms=3000)
+    # 最后兜底：复用本机已登录 Chrome（CDP 9222）里停靠的 s.weibo.cn 标签页
+    # 2026-10-17 实测：该页停靠后台时 DOM 是空的，必须先 reload 再取
+    html = cdp_reuse("s.weibo.cn/top/summary", JS_LINKS, wait_ms=2500,
+                     reload_first=True)
     if html:
         out = []
-        for m in re.finditer(r'href="/weibo\?q=([^"&]+)[^"]*"[^>]*>\s*([^<]+?)\s*<', html):
-            q = urllib.parse.unquote(m.group(1)).lstrip("#").rstrip("#")
-            if not q:
+        for t, h in html:
+            q = t.replace("#", "").strip()
+            if len(q) < 3:
                 continue
             out.append({"platform": n, "rank": len(out) + 1, "title": q,
-                        "url": "https://s.weibo.cn/weibo?q=" + m.group(1),
+                        "url": "https://s.weibo.cn/weibo?q=" + urllib.parse.quote("#%s#" % q),
                         "hot": None, "tag": None})
         if out:
             _ok(n); return out[:50]
-        _err(n, "CDP 打开成功但没解析到榜单（可能未登录）")
+        _err(n, "CDP 标签页打开成功但没解析到榜单（可能未登录或未渲染）")
     else:
-        _err(n, "接口被反爬(403/访客系统)，且本机 CDP 9222 无 Chrome —— "
-                "启动 Chrome：chrome.exe --remote-debugging-port=9222 并用它登录微博后重试")
+        _err(n, "接口被反爬(403/访客系统)，且 CDP 9222 没有 s.weibo.cn 标签页 —— "
+                "用带 --remote-debugging-port=9222 的 Chrome 登录微博后重试")
     return []
 
 
@@ -297,12 +328,56 @@ def douyin():
 
 # ---------------------------------------------------------------- 快手
 def kuaishou():
+    """快手热榜。
+
+    2026-10-17 实测：
+      - 新版 https://www.kuaishou.com/new-reco 未登录只有 8 个导航链接，无热榜
+      - 点「返回旧版」→ https://www.kuaishou.com/?isHome=1&source=NewReco
+        **有公开的「快手热榜」**，容器 class=rank-container，条目含标题+热度
+      - 直接访问旧版 URL 会 ERR_CONNECTION_CLOSED（要先从新版跳转带 cookie）
+      - 新开 page 反复 goto 会被限流 → 复用 Chrome 9222 里已停靠的旧版标签页
+    """
     n = "快手"
-    try:
-        d = json.loads(_get("https://www.kuaishou.com/?isHome=1"))
-        _err(n, "页面无公开热榜 JSON（需登录态/CDP）")
-    except Exception as e:
-        _err(n, e)
+    js = r"""() => {
+      const heads = [...document.querySelectorAll('*')].filter(
+        e => e.children.length === 0 && (e.innerText || '').trim() === '快手热榜');
+      if (!heads.length) return [];
+      const h = heads[0];
+      let box = h;
+      for (let i = 0; i < 8 && box.parentElement; i++) {
+        box = box.parentElement;
+        const items = [...box.querySelectorAll('a')].filter(x => {
+          const t = (x.innerText || '').trim();
+          return t.length > 5 && t.length < 90;
+        });
+        if (items.length >= 5) {
+          const seen = new Set(); const out = [];
+          for (const x of items) {
+            const raw = (x.innerText || '').trim();
+            const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+            // 形如 ["高市早苗向靖国神社献祭品", "1152.3万热度"]，第一行是标题
+            const title = lines[0] || '';
+            if (!title || seen.has(title)) continue;
+            seen.add(title);
+            let hot = null;
+            for (const ln of lines) { const m = ln.match(/([\d.]+)\s*万热度/); if (m) hot = Math.round(parseFloat(m[1]) * 10000); }
+            out.push([title.slice(0, 90), String(x.href || '').slice(0, 160), hot]);
+          }
+          return out.slice(0, 50);
+        }
+      }
+      return [];
+    }"""
+    data = cdp_reuse("kuaishou.com/?isHome", js, wait_ms=0)
+    if data:
+        out = []
+        for i, (t, h, hot) in enumerate(data):
+            out.append({"platform": n, "rank": i + 1, "title": t,
+                        "url": h, "hot": hot, "tag": None})
+        if out:
+            _ok(n); return out
+    _err(n, "CDP 9222 里没有快手旧版标签页。开法：Chrome --remote-debugging-port=9222 "
+            "登录快手 → 打开 www.kuaishou.com/new-reco → 点「返回旧版」，然后重试")
     return []
 
 
@@ -313,16 +388,32 @@ def ithome():
         import html as _h
         t = _get("https://www.ithome.com/rss/")
         out = []
-        for m in re.finditer(r"<item>\s*<title>(.*?)</title>.*?<link>(.*?)</link>", t, re.S):
-            title = _h.unescape(m.group(1)).strip()
-            if title:
-                out.append({"platform": n, "rank": len(out) + 1, "title": title,
-                            "url": _h.unescape(m.group(2)).strip(), "hot": None, "tag": None})
+        # 2026-10-17 修：旧正则要求 <link>，但 IT之家 RSS 的 item 里**没有 <link>**
+        # （只有 title/description/pubDate/guid），所以永远匹配 0 条。
+        # 改为按 item 块切，title 必取，link 从 guid/description 里找，找不到就留空。
+        for m in re.finditer(r"<item>(.*?)</item>", t, re.S):
+            blk = m.group(1)
+            tm = re.search(r"<title>(.*?)</title>", blk, re.S)
+            if not tm:
+                continue
+            title = _h.unescape(tm.group(1)).strip()
+            if not title:
+                continue
+            url = ""
+            gm = re.search(r"<guid[^>]*>(.*?)</guid>", blk, re.S)
+            if gm and gm.group(1).startswith("http"):
+                url = _h.unescape(gm.group(1)).strip()
+            if not url:
+                lm = re.search(r"https://www\.ithome\.com/0/\d+/\d+\.htm", blk)
+                if lm:
+                    url = lm.group(0)
+            out.append({"platform": n, "rank": len(out) + 1, "title": title,
+                        "url": url, "hot": None, "tag": None})
             if len(out) >= 30:
                 break
         if out:
             _ok(n); return out
-        _err(n, "RSS 0 条")
+        _err(n, "RSS 0 条（len=%d）" % len(t))
     except Exception as e:
         _err(n, e)
     return []
@@ -347,16 +438,21 @@ def _render(url, wait_ms=4000, extract_js=None):
 
 def kr36():
     n = "36氪"
-    js = """() => {
+    js = r"""() => {
       const out = [];
       document.querySelectorAll('a').forEach(a => {
         const t = (a.innerText || '').trim();
         const h = a.href || '';
         if (t.length > 12 && h.includes('/p/')) out.push([t, h]);
       });
-      return out.slice(0, 30);
+      const seen = new Set(); const res = [];
+      for (const y of out) { if (!seen.has(y[0])) { seen.add(y[0]); res.push(y); } }
+      return res.slice(0, 30);
     }"""
     data = _render("https://www.36kr.com/hot-list/catalog", 5000, js)
+    if not data:
+        # 2026-10-17：headless 起不来时，复用 Chrome 9222 里已打开的 36氪 页
+        data = cdp_reuse("36kr.com", js)
     if data:
         out = []
         for i, (t, h) in enumerate(data):
@@ -370,18 +466,22 @@ def kr36():
 # ---------------------------------------------------------------- 澎湃 / 网易 / 腾讯新闻
 def pengpai():
     n = "澎湃"
-    # 旧接口 404、首页 403 → 走 headless 渲染热榜页
-    js = """() => {
+    # 旧接口 404、首页 403 → 走渲染；headless 不行就复用 CDP 9222
+    js = r"""() => {
       const out = [];
       document.querySelectorAll('a').forEach(a => {
         const t = (a.innerText || '').trim();
         const h = a.href || '';
         if (t.length > 10 && (h.includes('newsDetail_forward') || h.includes('thepaper.cn'))) out.push([t, h]);
       });
-      return out.slice(0, 25);
+      const seen = new Set(); const res = [];
+      for (const y of out) { if (!seen.has(y[0])) { seen.add(y[0]); res.push(y); } }
+      return res.slice(0, 25);
     }"""
     for u in ("https://www.thepaper.cn/list_115256", "https://www.thepaper.cn/channel_26916"):
         data = _render(u, 5000, js)
+        if not data:
+            data = cdp_reuse("thepaper.cn", js)
         if data:
             out = []
             for i, (t, h) in enumerate(data):
